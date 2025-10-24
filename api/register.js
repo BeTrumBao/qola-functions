@@ -130,7 +130,7 @@ module.exports = async (req, res) => {
                 uid: newUserRecordUid, email: email,
                 username: lowerCaseUsername, displayName: username,
                 bio: '', avatarUrl: `https://placehold.co/120x120?text=${username[0].toUpperCase()}`,
-                coverUrl: '', friends: [], blocked: [], needsSetup: false,
+                coverUrl: '', friends: [], blocked: [], needsSetup: true,
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
