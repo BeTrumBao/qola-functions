@@ -39,13 +39,20 @@ const auth = admin.apps.length ? admin.auth() : null;
 // --- Hàm xử lý chính ---
 module.exports = async (req, res) => {
     // --- CORS Headers ---
-    res.setHeader('Access-Control-Allow-Origin', '*'); // Đổi thành domain của cậu khi deploy
+    // --- KHỐI CODE CORS QUAN TRỌNG ---
+    // Cho phép request từ bất kỳ origin nào (tiện lợi khi dev)
+    // **LƯU Ý:** Khi deploy thật, nên đổi '*' thành domain web của cậu (vd: https://your-qola-app.vercel.app)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    // Cho phép các phương thức cần thiết
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    // Cho phép các header cần thiết (vd: Content-Type)
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    // Xử lý request OPTIONS (trình duyệt gửi trước khi POST để kiểm tra CORS)
     if (req.method === 'OPTIONS') {
-        return res.status(200).end();
+        return res.status(200).end(); // Trả về 200 OK ngay lập tức
     }
-    // -------------------
+    // --- KẾT THÚC KHỐI CORS ---
 
     // Kiểm tra SDK đã khởi tạo chưa
     if (!db || !auth) {
