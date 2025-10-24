@@ -2,167 +2,178 @@
 const admin = require('firebase-admin');
 
 // --- Cấu hình Firebase Admin SDK ---
-// Cậu cần lấy thông tin này từ file JSON đã tải về
-// **QUAN TRỌNG:** Không hardcode trực tiếp vào đây! Dùng Environment Variables.
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-
+// **QUAN TRỌNG:** Đảm bảo biến môi trường FIREBASE_SERVICE_ACCOUNT_KEY đã được setup trên Vercel
+let serviceAccount;
 try {
-    if (!admin.apps.length) { // Khởi tạo admin app nếu chưa có
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-            // databaseURL: "YOUR_DATABASE_URL" // Thêm nếu cần dùng Realtime DB Admin
-        });
+    // Cố gắng parse key từ biến môi trường
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    } else {
+        throw new Error("FIREBASE_SERVICE_ACCOUNT_KEY environment variable is not set.");
     }
 } catch (e) {
-    console.error('Firebase Admin Initialization Error', e);
+    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY:', e);
+    // Có thể throw lỗi ở đây để function fail luôn nếu key sai
+    // Hoặc xử lý mặc định tùy theo yêu cầu bảo mật
 }
-const db = admin.firestore();
-const auth = admin.auth();
+
+// Khởi tạo Firebase Admin App (chỉ một lần)
+try {
+    if (!admin.apps.length && serviceAccount) { // Chỉ khởi tạo nếu serviceAccount hợp lệ
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+            // databaseURL: "YOUR_DATABASE_URL" // Thêm nếu cần
+        });
+        console.log("Firebase Admin SDK initialized successfully.");
+    } else if (!serviceAccount) {
+         console.error("Firebase Admin SDK NOT initialized - Service Account Key is missing or invalid.");
+    }
+} catch (e) {
+    console.error('Firebase Admin Initialization Error:', e);
+}
+// Chỉ lấy db và auth nếu admin đã khởi tạo thành công
+const db = admin.apps.length ? admin.firestore() : null;
+const auth = admin.apps.length ? admin.auth() : null;
 // ------------------------------------
 
 // --- Hàm xử lý chính ---
 module.exports = async (req, res) => {
-    // Cho phép request từ bất kỳ origin nào (tiện lợi khi dev)
-    // **LƯU Ý:** Khi deploy thật, nên đổi '*' thành domain web của cậu (vd: https://your-qola-app.vercel.app)
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    // Cho phép các phương thức cần thiết
+    // --- CORS Headers ---
+    res.setHeader('Access-Control-Allow-Origin', '*'); // Đổi thành domain của cậu khi deploy
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    // Cho phép các header cần thiết (vd: Content-Type)
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-    // Xử lý request OPTIONS (trình duyệt gửi trước khi POST để kiểm tra CORS)
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
-    // --- KẾT THÚC KHỐI CORS ---
-    // Chỉ cho phép phương thức POST
+    // -------------------
+
+    // Kiểm tra SDK đã khởi tạo chưa
+    if (!db || !auth) {
+        console.error("Firebase Admin SDK is not initialized.");
+        return res.status(500).json({ error: 'Server configuration error.' });
+    }
+
+    // Chỉ cho phép POST
     if (req.method !== 'POST') {
         return res.status(405).json({ error: 'Method Not Allowed' });
     }
 
-    // Lấy IP từ header (Vercel)
+    // Lấy IP
     const ipAddress = req.headers['x-forwarded-for']?.split(',').shift() || req.socket?.remoteAddress;
     if (!ipAddress) {
-         console.error("Could not determine IP address. Headers:", req.headers);
-         return res.status(400).json({ error: 'Could not determine IP address.' });
+         console.warn("Could not determine IP address. Headers:", req.headers);
+         // Vẫn tiếp tục nhưng không check IP limit, hoặc trả lỗi tùy ý
+         // return res.status(400).json({ error: 'Could not determine IP address.' });
     }
-    // Chuẩn hóa IP (lấy phần cuối nếu là IPv6 mapped IPv4)
-    const normalizedIp = ipAddress.includes(':') ? ipAddress.split(':').slice(-1)[0] : ipAddress;
+    const normalizedIp = ipAddress ? (ipAddress.includes(':') ? ipAddress.split(':').slice(-1)[0] : ipAddress) : null;
 
-    const { username, email, password } = req.body; // Lấy data từ request body
+    const { username, email, password } = req.body;
+    const lowerCaseUsername = username?.toLowerCase(); // Thêm ?. để tránh lỗi nếu username là null/undefined
 
-    // --- Kiểm tra Input phía server ---
+    // --- Kiểm tra Input ---
     if (!username || !email || !password || password.length < 6 || username.length < 3 || /\s/.test(username) || !/^[a-z0-9_.]+$/.test(username)) {
         return res.status(400).json({ error: 'Invalid registration data.' });
     }
-    const lowerCaseUsername = username.toLowerCase(); // Luôn dùng lowercase để check/lưu
 
-    // --- Bắt đầu Transaction để đảm bảo tính nhất quán ---
     try {
+        // --- BƯỚC 1: KIỂM TRA EMAIL TỒN TẠI (NGOÀI TRANSACTION) ---
+        try {
+            await auth.getUserByEmail(email);
+            console.log(`Email already exists: ${email}`);
+            return res.status(409).json({ error: 'Email already in use.' });
+        } catch (error) {
+            if (error.code !== 'auth/user-not-found') {
+                console.error("Error checking email BEFORE transaction:", error);
+                throw new Error('Error verifying email availability.');
+            }
+            console.log(`Email available: ${email}`);
+        }
+
+        // --- BƯỚC 2: CHẠY TRANSACTION ---
+        let newUserRecordUid = null; // Chỉ lưu UID để trả về
         await db.runTransaction(async (transaction) => {
-            // 1. Kiểm tra giới hạn IP
-            const ipRef = db.collection('ipRegistrationCounts').doc(normalizedIp);
-            const ipDoc = await transaction.get(ipRef);
-            const currentCount = ipDoc.exists ? ipDoc.data().count : 0;
-
-            if (currentCount >= 3) {
-                throw new Error('IP limit reached'); // Ném lỗi để transaction rollback
+            // 2.1. Kiểm tra giới hạn IP (chỉ check nếu lấy được IP)
+            if (normalizedIp) {
+                 const ipRef = db.collection('ipRegistrationCounts').doc(normalizedIp);
+                 const ipDoc = await transaction.get(ipRef);
+                 const currentCount = ipDoc.exists ? ipDoc.data().count : 0;
+                 if (currentCount >= 3) {
+                     throw new Error('IP limit reached');
+                 }
+            } else {
+                 console.warn("Skipping IP limit check as IP address is unavailable.");
             }
 
-            // 2. Kiểm tra email tồn tại (trong Auth)
-            try {
-                await auth.getUserByEmail(email);
-                // Nếu không lỗi -> email đã tồn tại
-                throw new Error('Email already in use');
-            } catch (error) {
-                if (error.code !== 'auth/user-not-found') {
-                    console.error("Error checking email:", error);
-                    throw new Error('Error checking email'); // Lỗi khác
-                }
-                // Email hợp lệ, tiếp tục
-            }
 
-            // 3. Kiểm tra username tồn tại (trong Firestore)
+            // 2.2. Kiểm tra username tồn tại (trong Firestore)
             const usersRef = db.collection("users");
             const qUsername = usersRef.where("username", "==", lowerCaseUsername);
-            const usernameSnapshot = await transaction.get(qUsername); // Dùng transaction.get
+            const usernameSnapshot = await transaction.get(qUsername);
             if (!usernameSnapshot.empty) {
                 throw new Error('Username already in use');
             }
 
-            // --- Nếu mọi thứ OK ---
-            // 4. Tạo User Auth (bên ngoài transaction vì là thao tác Auth)
-            let newUserRecord;
+            // --- Nếu IP (nếu có check) và Username OK ---
+            // 2.3. Tạo User Auth (BẮT BUỘC NGOÀI TRANSACTION) - Tạo trước để lấy UID
+            let tempUserRecord;
             try {
-                 newUserRecord = await auth.createUser({
+                 tempUserRecord = await auth.createUser({
                      email: email,
                      password: password,
-                     displayName: username // Gán display name ban đầu
+                     displayName: username
                  });
+                 newUserRecordUid = tempUserRecord.uid; // Lưu UID lại
+                 console.log(`Auth user created: ${newUserRecordUid}`);
             } catch (authError) {
                  console.error("Firebase Auth createUser error:", authError);
-                 // Cố gắng map lỗi Auth sang lỗi dễ hiểu hơn
                  if (authError.code === 'auth/email-already-exists') throw new Error('Email already in use');
                  if (authError.code === 'auth/invalid-password') throw new Error('Password is too weak');
-                 throw new Error('Failed to create Auth user'); // Lỗi chung
+                 throw new Error('Failed to create Auth user');
             }
 
-
-            // 5. Tạo User Document trong Firestore (Dùng transaction)
-            const userDocRef = db.collection('users').doc(newUserRecord.uid);
+            // 2.4. Tạo User Document trong Firestore (Dùng transaction)
+            const userDocRef = db.collection('users').doc(newUserRecordUid);
             transaction.set(userDocRef, {
-                uid: newUserRecord.uid,
-                email: newUserRecord.email,
-                username: lowerCaseUsername, // Lưu lowercase
-                displayName: username,
-                bio: '',
-                avatarUrl: `https://placehold.co/120x120?text=${username[0].toUpperCase()}`,
-                coverUrl: '',
-                friends: [],
-                blocked: [],
-                needsSetup: true,
+                uid: newUserRecordUid, email: email, // Lưu email từ input
+                username: lowerCaseUsername, displayName: username,
+                bio: '', avatarUrl: `https://placehold.co/120x120?text=${username[0].toUpperCase()}`,
+                coverUrl: '', friends: [], blocked: [], needsSetup: false,
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            // 6. Tăng bộ đếm IP (Dùng transaction)
-            transaction.set(ipRef, { count: admin.firestore.FieldValue.increment(1) }, { merge: true });
-
-            // Transaction tự commit nếu không có lỗi
-        });
+            // 2.5. Tăng bộ đếm IP (Dùng transaction - chỉ tăng nếu có check IP)
+            if (normalizedIp) {
+                 const ipRef = db.collection('ipRegistrationCounts').doc(normalizedIp);
+                 transaction.set(ipRef, { count: admin.firestore.FieldValue.increment(1) }, { merge: true });
+            }
+        }); // Kết thúc transaction
 
         // Nếu transaction thành công
-        console.log(`User registered successfully: ${username} from IP ${normalizedIp}`);
+        console.log(`User registered successfully: ${username} (UID: ${newUserRecordUid}) from IP ${normalizedIp || 'Unknown'}`);
+        // Không cần trả UID về client
         return res.status(200).json({ success: true, message: 'Registration successful!' });
 
     } catch (error) {
-        // Xử lý lỗi từ transaction hoặc lỗi tạo Auth user
-        console.error("Registration transaction failed:", error);
-        let userMessage = 'Registration failed.';
-        let statusCode = 500; // Lỗi server mặc định
+        // Xử lý lỗi từ việc kiểm tra email ban đầu HOẶC từ transaction
+        console.error("Registration failed:", error);
+        let userMessage = 'Registration failed. Please try again.';
+        let statusCode = 500;
 
-        if (error.message === 'IP limit reached') {
-            userMessage = 'IP address registration limit reached.';
-            statusCode = 429; // Too Many Requests
-        } else if (error.message === 'Email already in use') {
-            userMessage = 'Email already in use.';
-            statusCode = 409; // Conflict
-        } else if (error.message === 'Username already in use') {
-            userMessage = 'Username already in use.';
-            statusCode = 409; // Conflict
-        } else if (error.message === 'Password is too weak') {
-            userMessage = 'Password must be at least 6 characters.';
-            statusCode = 400; // Bad Request
-        } else if (error.message === 'Failed to create Auth user') {
-             userMessage = 'Could not create user account.';
-             // Giữ statusCode 500
-        } else if (error.message === 'Error checking email') {
-             userMessage = 'Error verifying email availability.';
-             // Giữ statusCode 500
+        if (error.message === 'IP limit reached') { statusCode = 429; userMessage = 'IP address registration limit reached.'; }
+        else if (error.message === 'Email already in use') { statusCode = 409; userMessage = 'Email already in use.'; }
+        else if (error.message === 'Username already in use') { statusCode = 409; userMessage = 'Username already in use.'; }
+        else if (error.message === 'Password is too weak') { statusCode = 400; userMessage = 'Password must be at least 6 characters.'; }
+        else if (error.message === 'Error verifying email availability.') { statusCode = 503; userMessage = 'Could not verify email. Please try again.'; }
+        else if (error.message === 'Failed to create Auth user') { userMessage = 'Could not create user account.'; }
+
+        // Cố gắng dọn dẹp Auth user nếu lỡ tạo mà transaction lỗi
+        // Quan trọng: Chỉ nên xóa nếu lỗi xảy ra SAU khi đã tạo Auth user thành công
+        if (newUserRecordUid && (error.message === 'IP limit reached' || error.message === 'Username already in use' /* || các lỗi Firestore khác */) ) {
+             console.warn(`Attempting to delete orphaned Auth user: ${newUserRecordUid}`);
+             await auth.deleteUser(newUserRecordUid)
+                  .then(() => console.log(`Successfully deleted orphaned Auth user: ${newUserRecordUid}`))
+                  .catch(delErr => console.error(`Failed to delete orphaned Auth user ${newUserRecordUid}:`, delErr));
         }
-
-
-        // Cố gắng dọn dẹp nếu lỡ tạo user Auth mà transaction lỗi sau đó
-        // (Phần này hơi khó để làm hoàn hảo, tạm bỏ qua để đơn giản)
 
         return res.status(statusCode).json({ error: userMessage });
     }
